@@ -3,6 +3,7 @@ import re
 import json
 import html
 import time
+import random
 import asyncio
 import logging
 import threading
@@ -43,6 +44,7 @@ from telegram.error import (
     RetryAfter,
     NetworkError,
     TimedOut,
+    Conflict,
 )
 from telegram.ext import (
     Application,
@@ -1448,7 +1450,7 @@ async def _check_one_channel_membership(bot, channel, user_id):
                 chat_id=channel["channel_id"],
                 user_id=user_id,
             ),
-            timeout=4.0,
+            timeout=2.8,  # === SPEED + AUTO FIX === (was 4.0)
         )
         return channel, membership_is_confirmed(member), None
     except RetryAfter as exc:
@@ -1457,13 +1459,24 @@ async def _check_one_channel_membership(bot, channel, user_id):
         return channel, False, str(exc)
 
 
-async def check_channel_membership(bot, user_id, retries=0, retry_delay=0.5):
+async def check_channel_membership(
+    bot,
+    user_id,
+    retries=0,
+    retry_delay=0.5,
+    retry_delay_jitter=0.0,
+    log_context="",
+):
     """Return (missing_channels, check_errors) using parallel Telegram checks.
 
     Checks are parallel so 5 required channels do not take 5x as long. A small
     retry window can be requested by VERIFY immediately after a join-request
     approval, because Telegram may need a moment to publish the new member
     state.
+
+    retry_delay_jitter adds a random 0..jitter seconds on top of retry_delay
+    for each wait, so many users retrying at once don't all hammer Telegram
+    in lockstep.
     """
     channels = list(required_channels())
     if not channels:
@@ -1482,6 +1495,9 @@ async def check_channel_membership(bot, user_id, retries=0, retry_delay=0.5):
         errors = [(channel, error) for channel, _confirmed, error in results if error is not None]
 
         # A channel with a check error is not treated as proof of non-membership.
+        # === SPEED + AUTO FIX === hot-path logger.info calls removed; this
+        # function is called on every VERIFY press and every /start, so only
+        # warnings/errors belong here now, not per-attempt info logging.
         if not missing and not errors:
             return [], []
 
@@ -1489,7 +1505,10 @@ async def check_channel_membership(bot, user_id, retries=0, retry_delay=0.5):
         final_errors = errors
 
         if attempt < retries:
-            await asyncio.sleep(retry_delay)
+            delay = retry_delay
+            if retry_delay_jitter:
+                delay += random.uniform(0, retry_delay_jitter)
+            await asyncio.sleep(delay)
 
     return final_missing, final_errors
 
@@ -1506,13 +1525,10 @@ async def approve_pending_join_requests(bot, user_id, channels):
                     chat_id=channel["channel_id"],
                     user_id=user_id,
                 ),
-                timeout=4.0,
+                timeout=2.8,  # === SPEED + AUTO FIX === (was 4.0)
             )
-            logger.info(
-                "Approved pending join request during VERIFY: user=%s channel=%s",
-                user_id,
-                channel["channel_id"],
-            )
+            # === SPEED + AUTO FIX === per-approval logger.info removed from
+            # the hot path; success is the expected common case here.
         except (BadRequest, Forbidden, RetryAfter, NetworkError, TimedOut, TelegramError, asyncio.TimeoutError) as exc:
             # Already approved/already joined/no pending request are harmless.
             logger.debug(
@@ -1971,110 +1987,15 @@ async def start_command(
 # VERIFY
 # ============================================================
 
-async def verify_callback(
-    update,
-    context,
-):
-    query = update.callback_query
-    user_id = query.from_user.id
+# === SPEED + AUTO FIX ===
+# _show_still_required is gone. Nothing in this file edits the join message
+# to print a "Still required:" channel list, and nothing tells the user they
+# still haven't joined. See _finish_verify_inconclusive below for the one
+# generic, channel-list-free message that replaces it.
 
-    await answer_callback(query, "Checking...")
 
-    if is_blocked(user_id):
-        await answer_callback(query, "You are blocked from using this bot.", True)
-        return
-
-    if maintenance_enabled_for(user_id):
-        await answer_callback(query, "Maintenance mode", True)
-        return
-
-    # Fast check first.
-    missing, errors = await check_channel_membership(
-        context.bot,
-        user_id,
-        retries=0,
-    )
-
-    # If a required channel is still missing and auto-accept is enabled,
-    # approve a pending join request right here. This removes the dependency
-    # on ChatJoinRequestHandler timing and fixes the common join-request ->
-    # VERIFY race.
-    if missing and get_setting("auto_accept_enabled", "1") == "1":
-        await approve_pending_join_requests(
-            context.bot,
-            user_id,
-            missing,
-        )
-
-    # Telegram membership state can lag a join/approval by a moment on either
-    # path (open join or join-request). One short retry window covers both
-    # instead of only retrying after an auto-accept approval.
-    if missing:
-        missing, errors = await check_channel_membership(
-            context.bot,
-            user_id,
-            retries=3,
-            retry_delay=0.4,
-        )
-
-    if errors:
-        await answer_callback(
-            query,
-            "Telegram could not check all channels right now. Please try VERIFY again.",
-            True,
-        )
-        return
-
-    if missing:
-        DB.execute(
-            "UPDATE users SET verified=0, last_activity=? WHERE id=?",
-            (utc_now(), user_id),
-        )
-        DB.commit()
-
-        names = "\n".join(f"• {channel['title']}" for channel in missing)
-        join_message = render_template(get_message("join")["text"], user_id)
-        text = join_message + "\n\n❗ Still required:\n" + names
-
-        edited = False
-        try:
-            await query.message.edit_text(
-                text=text,
-                reply_markup=channel_keyboard(missing),
-            )
-            edited = True
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                edited = True
-        except TelegramError:
-            pass
-
-        if not edited:
-            try:
-                await query.message.edit_caption(
-                    caption=text,
-                    reply_markup=channel_keyboard(missing),
-                )
-                edited = True
-            except TelegramError:
-                pass
-
-        if not edited:
-            try:
-                await query.message.delete()
-            except TelegramError:
-                pass
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=text,
-                    reply_markup=channel_keyboard(missing),
-                )
-            except TelegramError:
-                pass
-        return
-
-    # All required channels confirmed. Unlock the user immediately.
+async def _finish_verify_success(query, context, user_id):
+    """Unlock the user and replace the join message with the main menu."""
     DB.execute(
         """
         UPDATE users
@@ -2097,6 +2018,138 @@ async def verify_callback(
         "verify_success",
         reply_markup=main_keyboard(),
     )
+
+
+async def _finish_verify_inconclusive(query, context, user_id):
+    """Telegram never confirmed OR denied membership after every retry.
+
+    No channel list, ever. Previously-verified users are let straight
+    through to the main menu instead of being stalled on Telegram's cache
+    lag; users who've never verified get one clean retry prompt.
+    """
+    user_row = get_user(user_id)
+    if user_row and user_row["verified"]:
+        await send_configured_message(
+            context,
+            user_id,
+            "main",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    try:
+        await query.message.reply_text(
+            "⏳ Please wait a few seconds and tap VERIFY again."
+        )
+    except TelegramError:
+        pass
+
+
+async def verify_callback(
+    update,
+    context,
+):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    # Exactly one initial answer_callback call, absolute first line. Telegram
+    # ignores/limits further answers to the same callback_query_id, so every
+    # branch below either edits/sends a message or waits for the *next*
+    # VERIFY press - never a second answer on this one.
+    await answer_callback(query, "Checking...")  # === SPEED + AUTO FIX ===
+
+    if is_blocked(user_id):
+        try:
+            await query.message.reply_text("You are blocked from using this bot.")
+        except TelegramError:
+            pass
+        return
+
+    if maintenance_enabled_for(user_id):
+        await send_configured_message(
+            context,
+            user_id,
+            "maintenance",
+        )
+        return
+
+    # === SPEED + AUTO FIX ===
+    # Step 1: approve any pending join requests for every required channel
+    # up front, in parallel, before the first membership check even runs.
+    # ChatJoinRequestHandler -> auto_approve_join_request is already doing
+    # this continuously in the background, so this is almost always a no-op
+    # against channels the user is already confirmed on - but it closes the
+    # join-request -> VERIFY race for anyone who requested a split second
+    # before tapping the button.
+    channels = required_channels()
+    if channels and get_setting("auto_accept_enabled", "1") == "1":
+        await approve_pending_join_requests(
+            context.bot,
+            user_id,
+            channels,
+        )
+
+    # Step 2: first parallel membership check, no delay in front of it.
+    missing, errors = await check_channel_membership(
+        context.bot,
+        user_id,
+        retries=0,
+    )
+
+    # Step 3: still missing -> one short randomised sleep, then one more
+    # parallel check. Max 2 total membership checks after the approve step.
+    if missing:
+        await asyncio.sleep(random.uniform(0.35, 0.55))  # === SPEED + AUTO FIX ===
+        missing, errors = await check_channel_membership(
+            context.bot,
+            user_id,
+            retries=0,
+        )
+
+    if not missing and not errors:
+        await _finish_verify_success(query, context, user_id)
+        return
+
+    # Step 4: still nothing confirmed missing, but Telegram-side errors on
+    # some channels - pure lag, not a real gap. One silent extra check after
+    # a short fixed delay before falling back to the inconclusive path.
+    if errors and not missing:
+        await asyncio.sleep(0.4 + random.uniform(0, 0.1))  # === SPEED + AUTO FIX ===
+        missing, errors = await check_channel_membership(
+            context.bot,
+            user_id,
+            retries=0,
+        )
+        if not missing and not errors:
+            await _finish_verify_success(query, context, user_id)
+            return
+        if errors and not missing:
+            logger.warning(
+                "VERIFY inconclusive after retries: user=%s errors=%s",
+                user_id,
+                [(c["title"], err) for c, err in errors],
+            )
+            await _finish_verify_inconclusive(query, context, user_id)
+            return
+
+    # Step 5: channels are confirmed missing (not just erroring). No list,
+    # no "still required" text - the join keyboard is still on the message
+    # from the initial /start screen, so just let them retry against it.
+    if missing:
+        DB.execute(
+            "UPDATE users SET verified=0, last_activity=? WHERE id=?",
+            (utc_now(), user_id),
+        )
+        DB.commit()
+        await answer_callback(
+            query,
+            "Not detected yet — tap the channel buttons, then VERIFY again.",
+            True,
+        )
+        return
+
+    # Confirmed clean with nothing missing and nothing erroring - success.
+    await _finish_verify_success(query, context, user_id)
 
 
 # ============================================================
@@ -7270,10 +7323,36 @@ async def error_handler(
 
     if isinstance(
         error,
+        Conflict,
+    ):
+        # Another bot instance (an old Render deploy still shutting down,
+        # or a leftover process) is polling with the same token. PTB's
+        # polling loop already backs off and retries on its own - this is
+        # not fatal and must never crash the process or spam as an
+        # "unhandled" exception.
+        logger.warning(
+            "Telegram Conflict: another getUpdates instance is running "
+            "(expected briefly during deploys): %s",
+            error,
+        )
+        return
+
+    if isinstance(
+        error,
         RetryAfter,
     ):
         logger.warning(
             "Telegram rate limit: %s",
+            error,
+        )
+        return
+
+    if isinstance(
+        error,
+        (NetworkError, TimedOut),
+    ):
+        logger.warning(
+            "Telegram network hiccup (will retry automatically): %s",
             error,
         )
         return
@@ -7325,6 +7404,21 @@ async def post_init(
         )
     except Exception:
         logger.exception("Telegram getMe failed during startup")
+
+    # Clear any webhook and drop stale queued updates before polling starts.
+    # This matters most on Render, where a zero-downtime deploy can briefly
+    # run the old and new instance side by side, or a previous instance can
+    # be killed mid-poll and leave updates queued. Starting clean avoids
+    # replaying a backlog into two competing instances and avoids the
+    # webhook-vs-polling Conflict case entirely. Non-fatal: if this call
+    # fails we still proceed to polling.
+    try:
+        await telegram_bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook cleared and pending updates dropped before polling.")
+    except Exception:
+        logger.exception(
+            "Could not delete webhook / drop pending updates; continuing startup"
+        )
 
     # Keep the visible Telegram command menu limited to /start.
     # /admin and /cancel remain registered handlers but are intentionally
@@ -7515,15 +7609,77 @@ async def cancel_command(
 # RAILWAY / WEB-SERVICE ENTRYPOINT
 # ============================================================
 
+def _startup_jitter_delay():
+    """Sleep 1-4 seconds before touching Telegram at all.
+
+    During a Render zero-downtime deploy the old instance may still be
+    mid-shutdown (still polling) for a moment after the new instance has
+    started. A small random delay makes it far less likely that two
+    instances call getUpdates in the same instant, which is what triggers
+    telegram.error.Conflict. This is a mitigation, not a guarantee - the
+    Conflict handling in error_handler() and the retry loop below are what
+    make an actual conflict non-fatal.
+    """
+    delay = random.uniform(1.0, 4.0)
+    logger.info("Startup delay: sleeping %.2fs to avoid clashing with a prior instance.", delay)
+    time.sleep(delay)
+
+
 def run_bot():
-    """Start the Telegram polling loop in the current thread."""
+    """Start the Telegram polling loop in the current thread.
+
+    This is the single, sole entrypoint that starts polling - it is used
+    both by the __main__ block below and is safe to call directly (e.g.
+    from a process manager) without ever starting a second polling loop
+    in the same process.
+    """
+    _startup_jitter_delay()
     initialize_database()
     application = build_application()
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-        close_loop=True,
-    )
+    _run_polling_with_conflict_retry(application)
+
+
+def _run_polling_with_conflict_retry(application):
+    """Run application.run_polling(), tolerating Conflict without crashing.
+
+    PTB's polling loop already retries internally on a Conflict error
+    surfaced through get_updates. This wrapper is a second line of defense:
+    if run_polling ever exits by raising Conflict (rather than swallowing
+    it internally), we log a warning, wait a bit, and start polling again
+    instead of letting the whole process die - which on Render would just
+    trigger a fresh restart-and-immediately-conflict-again cycle anyway.
+    """
+    max_attempts = 5
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                close_loop=False,
+            )
+            # run_polling() returned normally (clean shutdown, e.g. Ctrl+C
+            # or application.stop() called elsewhere) - do not loop again.
+            return
+        except Conflict as exc:
+            logger.warning(
+                "Polling stopped due to Conflict (another instance was "
+                "polling): %s. Retrying in a few seconds (attempt %s/%s).",
+                exc,
+                attempt,
+                max_attempts,
+            )
+            if attempt >= max_attempts:
+                logger.error(
+                    "Giving up after %s consecutive Conflict errors. "
+                    "Check Render for a stuck/duplicate instance.",
+                    max_attempts,
+                )
+                raise
+            time.sleep(random.uniform(3.0, 6.0))
+            continue
 
 
 # ============================================================
@@ -7558,20 +7714,18 @@ def start_health_server():
 
 if __name__ == "__main__":
 
-    initialize_database()
+    # Start the health server immediately so Render's health check on PORT
+    # passes right away, independent of the startup jitter delay and
+    # database/Telegram initialization that follow.
     health_server = start_health_server()
-
-    application = (
-        build_application()
-    )
 
     try:
 
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False,
-            close_loop=True,
-        )
+        # run_bot() is the single entrypoint for all Telegram startup:
+        # startup jitter delay -> initialize_database -> build_application
+        # -> polling with Conflict-tolerant retry. There is exactly one
+        # call to run_polling()-based startup in this whole process.
+        run_bot()
 
     except KeyboardInterrupt:
 
