@@ -1377,8 +1377,25 @@ def channel_join_url(channel):
     return None
 
 
+_REQUIRED_CHANNELS_CACHE = {"rows": None, "expires": 0.0}
+_REQUIRED_CHANNELS_TTL = 3.0  # short TTL: kills redundant DB hits within one
+                               # /start or VERIFY round-trip without ever
+                               # going stale for more than a few seconds.
+                               # Not invalidated on admin channel edits on
+                               # purpose - 3s max staleness on a rarely-hit
+                               # admin action beats wiring cache-busting into
+                               # six separate mutation sites.
+
+
 def required_channels():
-    return db_all(
+    now = time.monotonic()
+    if (
+        _REQUIRED_CHANNELS_CACHE["rows"] is not None
+        and now < _REQUIRED_CHANNELS_CACHE["expires"]
+    ):
+        return _REQUIRED_CHANNELS_CACHE["rows"]
+
+    rows = db_all(
         """
         SELECT *
         FROM channels
@@ -1386,6 +1403,9 @@ def required_channels():
         ORDER BY position, id
         """
     )
+    _REQUIRED_CHANNELS_CACHE["rows"] = rows
+    _REQUIRED_CHANNELS_CACHE["expires"] = now + _REQUIRED_CHANNELS_TTL
+    return rows
 
 
 def channel_keyboard(channels=None):
@@ -1450,7 +1470,7 @@ async def _check_one_channel_membership(bot, channel, user_id):
                 chat_id=channel["channel_id"],
                 user_id=user_id,
             ),
-            timeout=2.8,  # === SPEED + AUTO FIX === (was 4.0)
+            timeout=random.uniform(1.9, 2.1),
         )
         return channel, membership_is_confirmed(member), None
     except RetryAfter as exc:
@@ -1525,7 +1545,7 @@ async def approve_pending_join_requests(bot, user_id, channels):
                     chat_id=channel["channel_id"],
                     user_id=user_id,
                 ),
-                timeout=2.8,  # === SPEED + AUTO FIX === (was 4.0)
+                timeout=random.uniform(1.9, 2.1),
             )
             # === SPEED + AUTO FIX === per-approval logger.info removed from
             # the hot path; success is the expected common case here.
@@ -1923,6 +1943,13 @@ async def start_command(
 
     if channels:
 
+        if get_setting("auto_accept_enabled", "1") == "1":
+            await approve_pending_join_requests(
+                context.bot,
+                user_id,
+                channels,
+            )
+
         missing, errors = (
             await check_channel_membership(
                 context.bot,
@@ -1987,11 +2014,11 @@ async def start_command(
 # VERIFY
 # ============================================================
 
-# === SPEED + AUTO FIX ===
-# _show_still_required is gone. Nothing in this file edits the join message
-# to print a "Still required:" channel list, and nothing tells the user they
-# still haven't joined. See _finish_verify_inconclusive below for the one
-# generic, channel-list-free message that replaces it.
+# _show_still_required is gone. The only text VERIFY ever shows on a
+# confirmed-missing result is a generic retry prompt via answer_callback -
+# no channel names, no "still not joined" phrasing. The message's own
+# keyboard is trimmed down to just the channels still outstanding. See
+# _finish_verify_inconclusive below for the transient-error fallback.
 
 
 async def _finish_verify_success(query, context, user_id):
@@ -2073,7 +2100,6 @@ async def verify_callback(
         )
         return
 
-    # === SPEED + AUTO FIX ===
     # Step 1: approve any pending join requests for every required channel
     # up front, in parallel, before the first membership check even runs.
     # ChatJoinRequestHandler -> auto_approve_join_request is already doing
@@ -2089,17 +2115,19 @@ async def verify_callback(
             channels,
         )
 
-    # Step 2: first parallel membership check, no delay in front of it.
+    # Step 2: one parallel membership check across every required channel.
     missing, errors = await check_channel_membership(
         context.bot,
         user_id,
         retries=0,
     )
 
-    # Step 3: still missing -> one short randomised sleep, then one more
-    # parallel check. Max 2 total membership checks after the approve step.
-    if missing:
-        await asyncio.sleep(random.uniform(0.35, 0.55))  # === SPEED + AUTO FIX ===
+    # Step 3: only retry once, only if the first pass didn't come back
+    # completely clean. One short randomised sleep - just enough for
+    # Telegram to publish a just-approved membership - then one more
+    # parallel check. Max two total membership checks, ever, per tap.
+    if missing or errors:
+        await asyncio.sleep(random.uniform(0.25, 0.45))
         missing, errors = await check_channel_membership(
             context.bot,
             user_id,
@@ -2110,46 +2138,35 @@ async def verify_callback(
         await _finish_verify_success(query, context, user_id)
         return
 
-    # Step 4: still nothing confirmed missing, but Telegram-side errors on
-    # some channels - pure lag, not a real gap. One silent extra check after
-    # a short fixed delay before falling back to the inconclusive path.
-    if errors and not missing:
-        await asyncio.sleep(0.4 + random.uniform(0, 0.1))  # === SPEED + AUTO FIX ===
-        missing, errors = await check_channel_membership(
-            context.bot,
-            user_id,
-            retries=0,
-        )
-        if not missing and not errors:
-            await _finish_verify_success(query, context, user_id)
-            return
-        if errors and not missing:
-            logger.warning(
-                "VERIFY inconclusive after retries: user=%s errors=%s",
-                user_id,
-                [(c["title"], err) for c, err in errors],
-            )
-            await _finish_verify_inconclusive(query, context, user_id)
-            return
-
-    # Step 5: channels are confirmed missing (not just erroring). No list,
-    # no "still required" text - the join keyboard is still on the message
-    # from the initial /start screen, so just let them retry against it.
     if missing:
+        # Confirmed missing, not just erroring - real gap. Show only the
+        # channels still outstanding, no banned phrasing, no full list.
         DB.execute(
             "UPDATE users SET verified=0, last_activity=? WHERE id=?",
             (utc_now(), user_id),
         )
         DB.commit()
+        try:
+            await query.message.edit_reply_markup(
+                reply_markup=channel_keyboard(missing)
+            )
+        except TelegramError:
+            pass
         await answer_callback(
             query,
-            "Not detected yet — tap the channel buttons, then VERIFY again.",
+            "Almost there — tap the channel buttons, then VERIFY.",
             True,
         )
         return
 
-    # Confirmed clean with nothing missing and nothing erroring - success.
-    await _finish_verify_success(query, context, user_id)
+    # Nothing confirmed missing, but Telegram-side errors persisted through
+    # the retry - pure lag, not a real gap.
+    logger.warning(
+        "VERIFY inconclusive after retry: user=%s errors=%s",
+        user_id,
+        [(c["title"], err) for c, err in errors],
+    )
+    await _finish_verify_inconclusive(query, context, user_id)
 
 
 # ============================================================
