@@ -1430,50 +1430,68 @@ def channel_keyboard(channels=None):
 def membership_is_confirmed(member):
     status = getattr(member, "status", "")
     is_member = getattr(member, "is_member", None)
-    # Telegram may return restricted members. They are members unless is_member is explicitly False.
-    return status in {"member", "administrator", "creator"} or (
-        status == "restricted" and is_member is not False
-    )
+
+    # Telegram can return restricted members. They are members unless
+    # is_member is explicitly False.
+    if status in {"member", "administrator", "creator"}:
+        return True
+    if status == "restricted":
+        return is_member is not False
+    return False
 
 
-async def check_channel_membership(bot, user_id, retries=1, retry_delay=1.0):
-    """
-    Return (missing_channels, check_errors).
+async def _check_one_channel_membership(bot, channel, user_id):
+    """Check one channel without letting one slow channel block all others."""
+    try:
+        member = await asyncio.wait_for(
+            bot.get_chat_member(
+                chat_id=channel["channel_id"],
+                user_id=user_id,
+            ),
+            timeout=4.0,
+        )
+        return channel, membership_is_confirmed(member), None
+    except RetryAfter as exc:
+        return channel, False, f"RetryAfter: {exc.retry_after}"
+    except (Forbidden, BadRequest, NetworkError, TimedOut, TelegramError, asyncio.TimeoutError) as exc:
+        return channel, False, str(exc)
 
-    Telegram can take a short moment to expose a newly-approved join request
-    through get_chat_member().  A small retry window prevents VERIFY from
-    incorrectly reporting "not joined" immediately after approval.
+
+async def check_channel_membership(bot, user_id, retries=0, retry_delay=0.5):
+    """Return (missing_channels, check_errors) using parallel Telegram checks.
+
+    Checks are parallel so 5 required channels do not take 5x as long. A small
+    retry window can be requested by VERIFY immediately after a join-request
+    approval, because Telegram may need a moment to publish the new member
+    state.
     """
     channels = list(required_channels())
     if not channels:
         return [], []
 
-    last_errors = []
-    for attempt in range(max(1, retries + 1)):
-        missing = []
-        errors = []
+    final_missing = list(channels)
+    final_errors = []
 
-        for channel in channels:
-            try:
-                member = await bot.get_chat_member(
-                    chat_id=channel["channel_id"],
-                    user_id=user_id,
-                )
-                if not membership_is_confirmed(member):
-                    missing.append(channel)
-            except RetryAfter as exc:
-                errors.append((channel, f"RetryAfter: {exc.retry_after}"))
-            except (Forbidden, BadRequest, NetworkError, TimedOut, TelegramError) as exc:
-                errors.append((channel, str(exc)))
+    for attempt in range(max(0, retries) + 1):
+        results = await asyncio.gather(
+            *(_check_one_channel_membership(bot, channel, user_id) for channel in channels),
+            return_exceptions=False,
+        )
 
-        if not missing:
-            return [], errors
+        missing = [channel for channel, confirmed, _error in results if not confirmed and _error is None]
+        errors = [(channel, error) for channel, _confirmed, error in results if error is not None]
 
-        last_errors = errors
+        # A channel with a check error is not treated as proof of non-membership.
+        if not missing and not errors:
+            return [], []
+
+        final_missing = missing
+        final_errors = errors
+
         if attempt < retries:
             await asyncio.sleep(retry_delay)
 
-    return missing, last_errors
+    return final_missing, final_errors
 
 
 async def approve_pending_join_requests(bot, user_id, channels):
@@ -1481,26 +1499,30 @@ async def approve_pending_join_requests(bot, user_id, channels):
     if get_setting("auto_accept_enabled", "1") != "1":
         return
 
-    for channel in channels:
+    async def approve_one(channel):
         try:
-            await bot.approve_chat_join_request(
-                chat_id=channel["channel_id"],
-                user_id=user_id,
+            await asyncio.wait_for(
+                bot.approve_chat_join_request(
+                    chat_id=channel["channel_id"],
+                    user_id=user_id,
+                ),
+                timeout=4.0,
             )
             logger.info(
                 "Approved pending join request during VERIFY: user=%s channel=%s",
                 user_id,
                 channel["channel_id"],
             )
-        except (BadRequest, Forbidden, RetryAfter, NetworkError, TimedOut, TelegramError) as exc:
-            # Already approved / already joined / request unavailable are all
-            # safe here; the membership check below is the source of truth.
+        except (BadRequest, Forbidden, RetryAfter, NetworkError, TimedOut, TelegramError, asyncio.TimeoutError) as exc:
+            # Already approved/already joined/no pending request are harmless.
             logger.debug(
                 "Join-request approval skipped/failed: user=%s channel=%s error=%s",
                 user_id,
                 channel["channel_id"],
                 exc,
             )
+
+    await asyncio.gather(*(approve_one(channel) for channel in channels))
 
 
 async def notify_admin_new_user(context, user):
@@ -1956,75 +1978,62 @@ async def verify_callback(
     query = update.callback_query
     user_id = query.from_user.id
 
-    await answer_callback(
-        query,
-        "Checking...",
-    )
+    await answer_callback(query, "Checking...")
 
     if is_blocked(user_id):
-        await answer_callback(
-            query,
-            "You are blocked from using this bot.",
-            True,
-        )
+        await answer_callback(query, "You are blocked from using this bot.", True)
         return
 
-    if maintenance_enabled_for(
-        user_id
-    ):
-        await answer_callback(
-            query,
-            "Maintenance mode",
-            True,
-        )
+    if maintenance_enabled_for(user_id):
+        await answer_callback(query, "Maintenance mode", True)
         return
 
-    # First check quickly. If the user has just sent a join request, try to
-    # approve it here as well so VERIFY does not depend on handler timing.
+    # Fast check first.
     missing, errors = await check_channel_membership(
         context.bot,
         user_id,
         retries=0,
     )
 
+    # If a required channel is still missing and auto-accept is enabled,
+    # approve a pending join request right here. This removes the dependency
+    # on ChatJoinRequestHandler timing and fixes the common join-request ->
+    # VERIFY race.
     if missing and get_setting("auto_accept_enabled", "1") == "1":
         await approve_pending_join_requests(
             context.bot,
             user_id,
             missing,
         )
-        # Give Telegram a few seconds to publish the new membership state.
+
+        # Telegram membership state can lag approval by a moment. Recheck
+        # quickly, in parallel, instead of making the user press VERIFY again.
         missing, errors = await check_channel_membership(
             context.bot,
             user_id,
-            retries=5,
-            retry_delay=0.8,
+            retries=6,
+            retry_delay=0.5,
         )
 
     if errors:
-        # A transient/permission/network error is NOT proof the user failed
-        # to join. Never touch the verified flag here — leave it exactly as
-        # it was, and just ask the user to tap VERIFY again.
         await answer_callback(
             query,
-            "Telegram could not check all channels right now. Please tap VERIFY again.",
+            "Telegram could not check all channels right now. Please try VERIFY again.",
             True,
         )
         return
 
     if missing:
-        DB.execute("UPDATE users SET verified=0, last_activity=? WHERE id=?", (utc_now(), user_id))
+        DB.execute(
+            "UPDATE users SET verified=0, last_activity=? WHERE id=?",
+            (utc_now(), user_id),
+        )
         DB.commit()
 
         names = "\n".join(f"• {channel['title']}" for channel in missing)
         join_message = render_template(get_message("join")["text"], user_id)
         text = join_message + "\n\n❗ Still required:\n" + names
 
-        # Prefer editing the existing join post so the same message updates
-        # to show only the still-missing channels instead of spamming a new
-        # message every time VERIFY is tapped. If edit fails, delete the
-        # old join message and send a fresh one with only the missing
-        # channels — never leave duplicate join posts stacking up.
         edited = False
         try:
             await query.message.edit_text(
@@ -2036,7 +2045,7 @@ async def verify_callback(
             if "message is not modified" in str(exc).lower():
                 edited = True
         except TelegramError:
-            edited = False
+            pass
 
         if not edited:
             try:
@@ -2046,24 +2055,24 @@ async def verify_callback(
                 )
                 edited = True
             except TelegramError:
-                edited = False
+                pass
 
         if not edited:
             try:
                 await query.message.delete()
             except TelegramError:
                 pass
-
             try:
                 await context.bot.send_message(
-                    user_id,
-                    text,
+                    chat_id=user_id,
+                    text=text,
                     reply_markup=channel_keyboard(missing),
                 )
             except TelegramError:
                 pass
         return
 
+    # All required channels confirmed. Unlock the user immediately.
     DB.execute(
         """
         UPDATE users
@@ -2071,12 +2080,8 @@ async def verify_callback(
             last_activity=?
         WHERE id=?
         """,
-        (
-            utc_now(),
-            user_id,
-        ),
+        (utc_now(), user_id),
     )
-
     DB.commit()
 
     try:
