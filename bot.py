@@ -1436,23 +1436,71 @@ def membership_is_confirmed(member):
     )
 
 
-async def check_channel_membership(bot, user_id):
-    """Return (missing_channels, check_errors). Errors never masquerade as missing membership."""
-    missing = []
-    errors = []
-    for channel in required_channels():
+async def check_channel_membership(bot, user_id, retries=1, retry_delay=1.0):
+    """
+    Return (missing_channels, check_errors).
+
+    Telegram can take a short moment to expose a newly-approved join request
+    through get_chat_member().  A small retry window prevents VERIFY from
+    incorrectly reporting "not joined" immediately after approval.
+    """
+    channels = list(required_channels())
+    if not channels:
+        return [], []
+
+    last_errors = []
+    for attempt in range(max(1, retries + 1)):
+        missing = []
+        errors = []
+
+        for channel in channels:
+            try:
+                member = await bot.get_chat_member(
+                    chat_id=channel["channel_id"],
+                    user_id=user_id,
+                )
+                if not membership_is_confirmed(member):
+                    missing.append(channel)
+            except RetryAfter as exc:
+                errors.append((channel, f"RetryAfter: {exc.retry_after}"))
+            except (Forbidden, BadRequest, NetworkError, TimedOut, TelegramError) as exc:
+                errors.append((channel, str(exc)))
+
+        if not missing:
+            return [], errors
+
+        last_errors = errors
+        if attempt < retries:
+            await asyncio.sleep(retry_delay)
+
+    return missing, last_errors
+
+
+async def approve_pending_join_requests(bot, user_id, channels):
+    """Best-effort approval of this user's pending join requests."""
+    if get_setting("auto_accept_enabled", "1") != "1":
+        return
+
+    for channel in channels:
         try:
-            member = await bot.get_chat_member(
+            await bot.approve_chat_join_request(
                 chat_id=channel["channel_id"],
                 user_id=user_id,
             )
-            if not membership_is_confirmed(member):
-                missing.append(channel)
-        except RetryAfter as exc:
-            errors.append((channel, f"RetryAfter: {exc.retry_after}"))
-        except (Forbidden, BadRequest, NetworkError, TimedOut, TelegramError) as exc:
-            errors.append((channel, str(exc)))
-    return missing, errors
+            logger.info(
+                "Approved pending join request during VERIFY: user=%s channel=%s",
+                user_id,
+                channel["channel_id"],
+            )
+        except (BadRequest, Forbidden, RetryAfter, NetworkError, TimedOut, TelegramError) as exc:
+            # Already approved / already joined / request unavailable are all
+            # safe here; the membership check below is the source of truth.
+            logger.debug(
+                "Join-request approval skipped/failed: user=%s channel=%s error=%s",
+                user_id,
+                channel["channel_id"],
+                exc,
+            )
 
 
 async def notify_admin_new_user(context, user):
@@ -1931,12 +1979,27 @@ async def verify_callback(
         )
         return
 
-    missing, errors = (
-        await check_channel_membership(
+    # First check quickly. If the user has just sent a join request, try to
+    # approve it here as well so VERIFY does not depend on handler timing.
+    missing, errors = await check_channel_membership(
+        context.bot,
+        user_id,
+        retries=0,
+    )
+
+    if missing and get_setting("auto_accept_enabled", "1") == "1":
+        await approve_pending_join_requests(
             context.bot,
             user_id,
+            missing,
         )
-    )
+        # Give Telegram a few seconds to publish the new membership state.
+        missing, errors = await check_channel_membership(
+            context.bot,
+            user_id,
+            retries=5,
+            retry_delay=0.8,
+        )
 
     if errors:
         # A transient/permission/network error is NOT proof the user failed
