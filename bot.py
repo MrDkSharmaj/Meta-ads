@@ -2006,13 +2006,15 @@ async def verify_callback(
             missing,
         )
 
-        # Telegram membership state can lag approval by a moment. Recheck
-        # quickly, in parallel, instead of making the user press VERIFY again.
+    # Telegram membership state can lag a join/approval by a moment on either
+    # path (open join or join-request). One short retry window covers both
+    # instead of only retrying after an auto-accept approval.
+    if missing:
         missing, errors = await check_channel_membership(
             context.bot,
             user_id,
-            retries=6,
-            retry_delay=0.5,
+            retries=3,
+            retry_delay=0.4,
         )
 
     if errors:
